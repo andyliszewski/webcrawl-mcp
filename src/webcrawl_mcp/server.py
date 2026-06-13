@@ -46,7 +46,7 @@ async def webcrawl_search(
     """
     if scrape_results:
         return await search_and_scrape(query, num_results)
-    return search(query, num_results)
+    return await search(query, num_results)
 
 
 @mcp.tool

@@ -167,12 +167,12 @@ async def crawl(
             continue
 
         try:
-            # Fetch the page
+            # Fetch the page once; reuse the HTML for both link/title
+            # extraction and content extraction.
             html = await fetch_url(current_url)
             title = extract_title(html)
 
-            # Extract content using scraper (will use cache if available)
-            scraped = await scrape(current_url)
+            scraped = await scrape(current_url, prefetched_html=html)
 
             results.append({
                 "url": current_url,

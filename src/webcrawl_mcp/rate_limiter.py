@@ -21,6 +21,7 @@ class RateLimiter:
         self.delay = delay
         self._last_request: dict[str, float] = {}
         self._retry_after: dict[str, float] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
     def _get_domain(self, url: str) -> str:
         """Extract domain from URL."""
@@ -30,34 +31,42 @@ class RateLimiter:
     async def wait_if_needed(self, url: str) -> None:
         """Wait if necessary to respect rate limit for domain.
 
+        Same-domain callers are serialized via a per-domain lock; without it,
+        concurrent tool calls would all observe the same last-request time,
+        wait the same amount, and then fire simultaneously.
+
         Args:
             url: URL about to be requested
         """
         domain = self._get_domain(url)
-        now = time.time()
+        lock = self._locks.setdefault(domain, asyncio.Lock())
 
-        # Check for Retry-After
-        if domain in self._retry_after:
-            retry_time = self._retry_after[domain]
-            if now < retry_time:
-                wait_time = retry_time - now
-                print(
-                    f"[webcrawl] rate limit: waiting {wait_time:.1f}s (Retry-After) for {domain}",
-                    file=sys.stderr,
-                )
-                await asyncio.sleep(wait_time)
-            del self._retry_after[domain]
+        async with lock:
+            # Check for Retry-After
+            if domain in self._retry_after:
+                wait_time = self._retry_after[domain] - time.time()
+                if wait_time > 0:
+                    print(
+                        f"[webcrawl] rate limit: waiting {wait_time:.1f}s (Retry-After) for {domain}",
+                        file=sys.stderr,
+                    )
+                    await asyncio.sleep(wait_time)
+                del self._retry_after[domain]
 
-        # Check normal rate limit
-        if domain in self._last_request:
-            elapsed = now - self._last_request[domain]
-            if elapsed < self.delay:
-                wait_time = self.delay - elapsed
-                print(
-                    f"[webcrawl] rate limit: waiting {wait_time:.1f}s for {domain}",
-                    file=sys.stderr,
-                )
-                await asyncio.sleep(wait_time)
+            # Check normal rate limit
+            if domain in self._last_request:
+                elapsed = time.time() - self._last_request[domain]
+                if elapsed < self.delay:
+                    wait_time = self.delay - elapsed
+                    print(
+                        f"[webcrawl] rate limit: waiting {wait_time:.1f}s for {domain}",
+                        file=sys.stderr,
+                    )
+                    await asyncio.sleep(wait_time)
+
+            # Reserve the slot before releasing the lock so the next caller
+            # spaces off this request even before its response arrives.
+            self._last_request[domain] = time.time()
 
     def record_request(self, url: str) -> None:
         """Record that a request was made to this URL's domain.

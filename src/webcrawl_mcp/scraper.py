@@ -130,7 +130,7 @@ async def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT) -> str:
                 seconds = _parse_retry_after(header)
                 if seconds is not None:
                     retry_after = seconds
-                    rate_limiter.set_retry_after(url, seconds)
+                    rate_limiter.set_retry_after(url, max(0.0, seconds))
 
         if response.status_code in TRANSPORT_FALLBACK_STATUSES:
             raise TransportError(
@@ -202,15 +202,19 @@ async def _fetch_html_or_fallback(
         html = await fetch_url(url, timeout)
         return ("static", html, "static_http")
     except TransportError as err:
-        # Polite retry: 429 with parseable Retry-After gets one bounded retry.
+        # Polite retry: 429 with parseable Retry-After gets one bounded retry,
+        # but only when the server's ask fits within our timeout — retrying
+        # early against a longer Retry-After would just earn another 429.
+        # The full value stays in the rate limiter either way, so future
+        # requests to the domain honor the server's ask.
         if (
             err.status_code == 429
             and _polite_mode()
             and err.retry_after is not None
+            and err.retry_after <= timeout
         ):
-            # Cap at timeout (hostile servers); clamp negatives to 0 so
-            # asyncio.sleep doesn't raise.
-            wait = max(0.0, min(err.retry_after, float(timeout)))
+            # Clamp negatives to 0 so asyncio.sleep doesn't raise.
+            wait = max(0.0, err.retry_after)
             print(
                 f"[webcrawl] 429 Retry-After {err.retry_after}s; polite retry "
                 f"after {wait:.1f}s for {url}",
@@ -248,7 +252,12 @@ async def _fetch_html_or_fallback(
         raise err
 
 
-async def scrape(url: str, timeout: int = DEFAULT_TIMEOUT) -> ScrapeResult:
+async def scrape(
+    url: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    prefetched_html: str | None = None,
+) -> ScrapeResult:
     """Fetch URL and extract main content as markdown.
 
     Dispatch:
@@ -262,6 +271,9 @@ async def scrape(url: str, timeout: int = DEFAULT_TIMEOUT) -> ScrapeResult:
     Args:
         url: The URL to scrape
         timeout: Request timeout in seconds
+        prefetched_html: HTML already fetched for this URL (e.g. by the
+            crawler for link extraction); skips the network fetch so the
+            page isn't requested twice.
 
     Returns:
         ScrapeResult carrying content and provenance source.
@@ -270,7 +282,10 @@ async def scrape(url: str, timeout: int = DEFAULT_TIMEOUT) -> ScrapeResult:
     if cached is not None:
         return cached
 
-    kind, payload, source = await _fetch_html_or_fallback(url, timeout)
+    if prefetched_html is not None:
+        kind, payload, source = "static", prefetched_html, "static_http"
+    else:
+        kind, payload, source = await _fetch_html_or_fallback(url, timeout)
 
     if kind == "firecrawl":
         result = ScrapeResult(content=payload, source=source)

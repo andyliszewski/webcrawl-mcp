@@ -213,17 +213,33 @@ async def test_429_without_retry_after_header_no_retry(
     assert fake_sleep == []
 
 
-async def test_retry_after_cap_bounded_by_timeout(
+async def test_retry_after_beyond_timeout_skips_retry(
     queue_responses, stub_extract, fake_firecrawl, fake_sleep
 ):
-    # Server returns Retry-After: 9999 with a 2s timeout — sleep must cap to 2.
+    # Server returns Retry-After: 9999 with a 2s timeout — retrying after a
+    # capped sleep would just earn another 429, so no retry happens and the
+    # transport error surfaces. (No second response queued: a retry would
+    # RuntimeError in FakeAsyncClient.)
     queue_responses.append(scraper_response(429, headers={"Retry-After": "9999"}))
+    fake_firecrawl.configured = False
+
+    with pytest.raises(TransportError) as exc:
+        await scraper.scrape(URL, timeout=2)
+    assert exc.value.status_code == 429
+    assert fake_sleep == []
+
+
+async def test_retry_after_within_timeout_still_retries(
+    queue_responses, stub_extract, fake_firecrawl, fake_sleep
+):
+    # Retry-After at exactly the timeout boundary is honored.
+    queue_responses.append(scraper_response(429, headers={"Retry-After": "2"}))
     queue_responses.append(scraper_response(200, HTML))
     fake_firecrawl.configured = False
 
     result = await scraper.scrape(URL, timeout=2)
     assert result.source == "static_http_retry"
-    assert max(fake_sleep) <= 2.0
+    assert fake_sleep == [2.0]
 
 
 async def test_retry_after_negative_clamped_to_zero(
@@ -346,6 +362,61 @@ async def test_provenance_value_set(
     queue_responses.append(scraper_response(200, HTML))
     r3 = await scraper.scrape("http://test.local/c")
     assert r3.source in VALID_SOURCES
+
+
+# --------------------------------------------------------------------------- #
+# prefetched_html — crawler passes HTML it already fetched; no second request
+# --------------------------------------------------------------------------- #
+
+
+async def test_prefetched_html_skips_network_fetch(
+    queue_responses, stub_extract, fake_firecrawl
+):
+    # No responses queued — any network fetch would raise RuntimeError
+    # from FakeAsyncClient.
+    fake_firecrawl.configured = False
+
+    result = await scraper.scrape(URL, prefetched_html=HTML)
+
+    assert result.source == "static_http"
+    assert result.content.startswith("extracted body")
+
+
+async def test_prefetched_html_still_runs_quality_fallback(
+    queue_responses, stub_extract, fake_firecrawl
+):
+    stub_extract("tiny")  # under MIN_CONTENT_LENGTH
+    fake_firecrawl.configured = True
+    fake_firecrawl.response = "firecrawl rescued long markdown content " * 10
+
+    result = await scraper.scrape(URL, prefetched_html=HTML)
+
+    assert result.source == "firecrawl_quality_fallback"
+    assert fake_firecrawl.calls == [URL]
+
+
+# --------------------------------------------------------------------------- #
+# The rate limiter gate keeps the server's FULL Retry-After so future requests
+# to the domain honor it, even when the immediate retry is skipped
+# --------------------------------------------------------------------------- #
+
+
+async def test_rate_limiter_gate_keeps_full_retry_after(
+    queue_responses, stub_extract, fake_firecrawl, fake_sleep, monkeypatch
+):
+    recorded: list[float] = []
+    monkeypatch.setattr(
+        scraper.rate_limiter,
+        "set_retry_after",
+        lambda url, seconds: recorded.append(seconds),
+    )
+
+    queue_responses.append(scraper_response(429, headers={"Retry-After": "9999"}))
+    fake_firecrawl.configured = False
+
+    with pytest.raises(TransportError):
+        await scraper.scrape(URL, timeout=2)
+    assert recorded == [9999.0]
 
 
 # --------------------------------------------------------------------------- #
