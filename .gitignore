@@ -41,6 +41,5 @@ htmlcov/
 Thumbs.db
 
 # Local / private
-BMAD-METHOD/
 .claude/
 .mcp.json
